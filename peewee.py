@@ -87,6 +87,7 @@ if PY3:
     basestring = str
     print_ = getattr(builtins, 'print')
     binary_construct = lambda s: bytes(s.encode('raw_unicode_escape'))
+    # TODO(lk): reraise
     def reraise(tp, value, tb=None):
         if value.__traceback__ is not tb:
             raise value.with_traceback(tb)
@@ -124,6 +125,7 @@ sqlite3.register_adapter(datetime.time, str)
 DATETIME_PARTS = ['year', 'month', 'day', 'hour', 'minute', 'second']
 DATETIME_LOOKUPS = set(DATETIME_PARTS)
 
+# CO(lk): try all possible dt fmt to convert value from sql into Python
 # Sqlite does not support the `date_part` SQL function, so we will define an
 # implementation in python.
 SQLITE_DATETIME_FORMATS = (
@@ -213,6 +215,8 @@ def not_allowed(func):
     return inner
 
 class Proxy(object):
+    # CO(lk): .attach_callback() before calling .initialize(). For object not
+    #  initialized yet but you want call func(obj). Delay the calling.
     """
     Proxy class useful for situations when you wish to defer the initialization
     of an object.
@@ -220,6 +224,8 @@ class Proxy(object):
     __slots__ = ['obj', '_callbacks']
 
     def __init__(self):
+        # NOTE(lk): defer the initialization and cb after init.
+        #  e.g. `Field.add_to_class()`
         self._callbacks = []
         self.initialize(None)
 
@@ -326,6 +332,7 @@ class Expression(Node):
         self.lhs = lhs
         self.op = op
         self.rhs = rhs
+        # TODO(lk): with or without ()
         self.flat = flat
 
     def clone_base(self):
@@ -412,6 +419,7 @@ class Entity(Node):
     """A quoted-name or entity, e.g. "table"."column"."""
     def __init__(self, *path):
         super(Entity, self).__init__()
+        # NOTE(lk): 'path' is a tuple
         self.path = path
 
     def clone_base(self):
@@ -431,6 +439,7 @@ class FieldDescriptor(object):
     # Fields are exposed as descriptors in order to control access to the
     # underlying "raw" data.
     def __init__(self, field):
+        # WARN(lk): when access a field, access Model._data['filed_name/att_name']
         self.field = field
         self.att_name = self.field.name
 
@@ -456,20 +465,24 @@ class Field(Node):
         self.null = null
         self.index = index
         self.unique = unique
+        # CO(lk): 'name' for python, 'db_column' for db, 'verbose_name' for display
         self.verbose_name = verbose_name
         self.help_text = help_text
         self.db_column = db_column
         self.default = default
         self.choices = choices  # Used for metadata purposes, not enforced.
         self.primary_key = primary_key
+        # CO(lk): Field.sequence affect next default/auto value
         self.sequence = sequence  # Name of sequence, e.g. foo_id_seq.
         self.constraints = constraints  # List of column constraints.
+        # CO(lk): schema is a PostgreSQL only thing
         self.schema = schema  # Name of schema, e.g. 'public'.
 
         # Used internally for recovering the order in which Fields were defined
         # on the Model class.
         Field._field_counter += 1
         self._order = Field._field_counter
+        # CO(lk): primary first, later normal key
         self._sort_key = (self.primary_key and 1 or 2), self._order
 
         self._is_bound = False  # Whether the Field is "bound" to a Model.
@@ -507,6 +520,8 @@ class Field(Node):
         if not self.verbose_name:
             self.verbose_name = re.sub('_+', ' ', name).title()
 
+        # CO(lk): meta fields for model field, columns for db column
+        #  db_field is the field type, not name (db_column)
         model_class._meta.fields[self.name] = self
         model_class._meta.columns[self.db_column] = self
 
@@ -518,6 +533,7 @@ class Field(Node):
 
     def get_column_type(self):
         field_type = self.get_db_field()
+        # TODO(lk): QueryCompiler
         return self.get_database().compiler().get_column_type(field_type)
 
     def field_attributes(self):
@@ -528,6 +544,7 @@ class Field(Node):
         return self.db_field
 
     def get_modifiers(self):
+        # CO(lk): field DDL description, e.g. decimal max digit. string max len
         return None
 
     def coerce(self, value):
@@ -542,12 +559,14 @@ class Field(Node):
         return value if value is None else self.coerce(value)
 
     def _as_entity(self, with_table=False):
+        # CO(lk): Entity is a place to describe the 'path': table.column
         if with_table:
             return Entity(self.model_class._meta.db_table, self.db_column)
         return Entity(self.db_column)
 
     def __ddl_column__(self, column_type):
         """Return the column type, e.g. VARCHAR(255) or REAL."""
+        # CO(lk): DDL, database definition language
         modifiers = self.get_modifiers()
         if modifiers:
             return SQL(
@@ -564,6 +583,7 @@ class Field(Node):
         if self.sequence:
             ddl.append(SQL("DEFAULT NEXTVAL('%s')" % self.sequence))
         if self.constraints:
+            # TODO(lk): constraints
             ddl.extend(self.constraints)
         return ddl
 
@@ -623,6 +643,7 @@ class DecimalField(Field):
         if self.auto_round:
             exp = D(10) ** (-self.decimal_places)
             rounding = self.rounding
+            # CO(lk): convert value with expotential
             return D(str(value)).quantize(exp, rounding=rounding)
         return value
 
@@ -682,6 +703,7 @@ def format_date_time(value, formats, post_process=None):
 
 def _date_part(date_part):
     def dec(self):
+        # CO(lk): SQL extract date is db specific. returns Func/Node repr.
         return self.model_class._meta.database.extract_date(date_part, self)
     return dec
 
@@ -787,6 +809,7 @@ class RelationDescriptor(FieldDescriptor):
         return self.field
 
     def __set__(self, instance, value):
+        # NOTE(lk): the 'value' set on foreign field could be Model or ID
         if isinstance(value, self.rel_model):
             instance._data[self.att_name] = value.get_id()
             instance._obj_cache[self.att_name] = value
@@ -798,12 +821,14 @@ class RelationDescriptor(FieldDescriptor):
 
 class ReverseRelationDescriptor(object):
     """Back-reference to expose related objects as a `SelectQuery`."""
+    # CO(lk): one-to-many relation
     def __init__(self, field):
         self.field = field
         self.rel_model = field.model_class
 
     def __get__(self, instance, instance_type=None):
         if instance is not None:
+            # TODO(lk): how field from m1 set/copied onto m2 in relationship
             return self.rel_model.select().where(self.field==instance.get_id())
         return self
 
@@ -814,11 +839,14 @@ class ForeignKeyField(IntegerField):
                 issubclass(rel_model, Model):
             raise TypeError('Unexpected value for `rel_model`.  Expected '
                             '`Model`, `Proxy` or "self"')
+        # WARN(lk): `name` is the field name access `rel_model`.
+        #  `related_name` one-to-many name to current field back from `rel_model`.
         self.rel_model = rel_model
         self._related_name = related_name
         self.deferred = isinstance(rel_model, Proxy)
         self.on_delete = on_delete
         self.on_update = on_update
+        # TODO(lk): foreign extra
         self.extra = extra
         super(ForeignKeyField, self).__init__(*args, **kwargs)
 
@@ -849,6 +877,7 @@ class ForeignKeyField(IntegerField):
         model_class._meta.columns[self.db_column] = self
 
         model_name = model_class._meta.name
+        # WARN(lk): back ref attr from rel_mode, one-to-many name
         self.related_name = self._related_name or '%s_set' % (model_name)
 
         if self.rel_model == 'self':
@@ -867,6 +896,7 @@ class ForeignKeyField(IntegerField):
         fk_descriptor = RelationDescriptor(self, self.rel_model)
         backref_descriptor = ReverseRelationDescriptor(self)
         setattr(model_class, name, fk_descriptor)
+        # CO(lk): .key on reverse model is implicitly set
         setattr(self.rel_model, self.related_name, backref_descriptor)
         self._is_bound = True
 
@@ -878,6 +908,8 @@ class ForeignKeyField(IntegerField):
         Overridden to ensure Foreign Keys use same column type as the primary
         key they point to.
         """
+        # CO(lk): foreign key db_field is defined on both sides, prefer it from
+        #  the related model.
         to_pk = self.rel_model._meta.primary_key
         if not isinstance(to_pk, PrimaryKeyField):
             return to_pk.get_db_field()
@@ -906,6 +938,7 @@ class CompositeKey(object):
         self.field_names = field_names
 
     def add_to_class(self, model_class, name):
+        # CO(lk): can't use Field.name cause mutli are provided, require 1 explicitly
         self.name = name
         setattr(model_class, name, self)
 
@@ -998,6 +1031,7 @@ class QueryCompiler(object):
         return sorted(field_dict.items(), key=lambda i: i[0]._sort_key)
 
     def _max_alias(self, alias_map):
+        # WARN(lk): alias for model in sql: 'as t1'
         max_alias = 0
         if alias_map:
             for alias in alias_map.values():
@@ -1019,6 +1053,7 @@ class QueryCompiler(object):
         unknown = False
         if isinstance(node, Expression):
             if isinstance(node.lhs, Field):
+                # CO(lk): call lhs.db_value() later
                 conv = node.lhs
             lhs, lparams = self.parse_node(node.lhs, alias_map, conv)
             rhs, rparams = self.parse_node(node.rhs, alias_map, conv)
@@ -1043,15 +1078,18 @@ class QueryCompiler(object):
                 params = [node.conv(node.value)]
             else:
                 params = [node.value]
+            # TODO(lk): why?
             unknown = True
         elif isinstance(node, SQL):
             sql = node.value
             params = list(node.params)
         elif isinstance(node, SelectQuery):
+            # CO(lk): join
             max_alias = self._max_alias(alias_map)
             alias_copy = alias_map and alias_map.copy() or None
             clone = node.clone()
             if not node._explicit_selection:
+                # CO(lk): select primary key by default?
                 clone._select = (clone.model_class._meta.primary_key,)
             sub, params = self.generate_select(clone, max_alias, alias_copy)
             sql = '(%s)' % sub
@@ -1129,6 +1167,7 @@ class QueryCompiler(object):
                     # Clear any alias on the join expression.
                     constraint = join.on.clone().alias()
                 else:
+                    # CO(lk): get the Model.field defines this join
                     field = src._meta.rel_for_model(dest, join.on)
                     if field:
                         left_field = field
@@ -1349,9 +1388,11 @@ class QueryResultWrapper(object):
         self.__idx = 0
 
         self._result_cache = []
+        # CO(lk): iteration done
         self._populated = False
         self._initialized = False
 
+        # CO(lk): model_class._meta.columns: {}, pointing to Field
         if meta is not None:
             self.column_meta, self.join_meta = meta
         else:
@@ -1411,9 +1452,11 @@ class ExtQueryResultWrapper(QueryResultWrapper):
         model = self.model
         conv = []
         identity = lambda x: x
+        # NOTE(lk): seems cursor.description stores column info
         for i in range(len(description)):
             func = identity
             column = description[i][0]
+            # TODO(lk): why select_column is not preferred
             if column in model._meta.columns:
                 field_obj = model._meta.columns[column]
                 column = field_obj.name
@@ -1426,6 +1469,7 @@ class ExtQueryResultWrapper(QueryResultWrapper):
                     func = select_column.arguments[0].python_value
                 else:
                     func = identity
+            # CO(lk): here 'column' is not column, but field name
             conv.append((i, column, func))
         self.conv = conv
 
@@ -1457,6 +1501,8 @@ class ModelQueryResultWrapper(QueryResultWrapper):
             attr = conv = None
             if isinstance(node, Field):
                 if isinstance(node, FieldProxy):
+                    # CO(lk): if FieldProxy, ._model_alias is the original Model
+                    #  but not .alias()
                     key = node._model_alias
                     constructor = node.model
                 else:
@@ -1464,10 +1510,12 @@ class ModelQueryResultWrapper(QueryResultWrapper):
                 attr = node.name
                 conv = node.python_value
             else:
+                # TODO(lk): what's column_meta, if it's not Field, what's it?
                 key = constructor = self.model
                 if isinstance(node, Expression) and node._alias:
                     attr = node._alias
             column_map.append((key, constructor, attr, conv))
+            # CO(lk): there may be multiple fk on one Model
             models.add(key)
 
         joins = self.join_meta
@@ -1504,6 +1552,8 @@ class ModelQueryResultWrapper(QueryResultWrapper):
         return instances[0]
 
     def construct_instance(self, row):
+        # CO(lk): since we are resolving current model and its related fk model,
+        #  that's why `collected_models` comes in.
         collected_models = {}
         for i, (key, constructor, attr, conv) in enumerate(self.column_map):
             value = row[i]
@@ -1519,6 +1569,7 @@ class ModelQueryResultWrapper(QueryResultWrapper):
         return collected_models
 
     def follow_joins(self, collected):
+        # CO(lk): prepared: instance who has been resolved as another model's fk
         prepared = [collected[self.model]]
         for (lhs, attr, rhs) in self.join_map:
             inst = collected[lhs]
@@ -1544,6 +1595,7 @@ class Query(Node):
         self.database = model_class._meta.database
 
         self._dirty = True
+        # CO(lk): _query_ctx, which model is being queried (for join)
         self._query_ctx = model_class
         self._joins = {self.model_class: []} # Join graph as adjacency list.
         self._where = None
@@ -1575,6 +1627,7 @@ class Query(Node):
 
     @returns_clone
     def where(self, *expressions):
+        # CO(lk): reduce and opration on new [expression]
         self._where = self._add_query_clauses(self._where, expressions)
 
     @returns_clone
@@ -1586,6 +1639,7 @@ class Query(Node):
             on = self._query_ctx._meta.fields[on]
         self._joins.setdefault(self._query_ctx, [])
         self._joins[self._query_ctx].append(Join(model_class, join_type, on))
+        # WARN(lk): switch to being joined model
         self._query_ctx = model_class
 
     @returns_clone
@@ -1612,31 +1666,40 @@ class Query(Node):
                 op = DJANGO_MAP[op]
             else:
                 op = OP_EQ
+            # TODO(lk): why for, multiple join in one query?!
+            #  check django doc for query style.
             for piece in key.split('__'):
                 model_attr = getattr(curr, piece)
                 if isinstance(model_attr, relationship):
                     curr = model_attr.rel_model
                     joins.append(model_attr)
             accum.append(Expression(model_attr, op, value))
+        # CO(lk): returns list of query/Expression,
         return accum, joins
 
     def filter(self, *args, **kwargs):
         # normalize args and kwargs into a new expression
         dq_node = Node()
+        # CO(lk): converted as Expression, lhs is empty `Node`
         if args:
             dq_node &= reduce(operator.and_, [a.clone() for a in args])
         if kwargs:
             dq_node &= DQ(**kwargs)
 
         # dq_node should now be an Expression, lhs = Node(), rhs = ...
+        # WARN(lk): the top dq_node/expression is a tree root, resolve
+        #  the expression tree, convert leaf `DQ` as `Expression`.
         q = deque([dq_node])
         dq_joins = set()
         while q:
             curr = q.popleft()
+            # CO(lk): ignore/trim the first empty query
             if not isinstance(curr, Expression):
                 continue
             for side, piece in (('lhs', curr.lhs), ('rhs', curr.rhs)):
                 if isinstance(piece, DQ):
+                    # CO(lk): query: list of resolved Expression.
+                    #  joins: list of fk Field (or reverse fk descriptor).
                     query, joins = self.convert_dict_to_node(piece.query)
                     dq_joins.update(joins)
                     expression = reduce(operator.and_, query)
@@ -1645,8 +1708,10 @@ class Query(Node):
                     expression._alias = piece._alias
                     setattr(curr, side, expression)
                 else:
+                    # CO(lk): DQ is leaf, no child. But for non-DQ, resolve it recursively
                     q.append(piece)
 
+        # CO(lk): trim the left empty Node out of Expression
         dq_node = dq_node.rhs
 
         query = self.clone()
@@ -1658,6 +1723,8 @@ class Query(Node):
                 lm, rm = field.field.rel_model, field.rel_model
                 field_obj = field.field
             query = query.ensure_join(lm, rm, field_obj)
+        # CO(lk): fk filter is resolve as join, non-fk filter bool and to
+        #  curent query
         return query.where(dq_node)
 
     def compiler(self):
@@ -1668,6 +1735,7 @@ class Query(Node):
 
     def _execute(self):
         sql, params = self.sql()
+        # CO(lk): returns cursor
         return self.database.execute_sql(sql, params, self.require_commit)
 
     def execute(self):
@@ -1735,6 +1803,7 @@ class SelectQuery(Query):
     def __init__(self, model_class, *selection):
         super(SelectQuery, self).__init__(model_class)
         self.require_commit = self.database.commit_select
+        # CO(lk): field specified
         self._explicit_selection = len(selection) > 0
         selection = selection or model_class._meta.get_fields()
         self._select = self._model_shorthand(selection)
@@ -1806,6 +1875,7 @@ class SelectQuery(Query):
 
     @returns_clone
     def order_by(self, *args):
+        # TODO(lk): what about `._meta.order_by` added in `Model.select()`?
         self._order_by = list(args)
 
     @returns_clone
@@ -1848,11 +1918,19 @@ class SelectQuery(Query):
         self._alias = alias
 
     def annotate(self, rel_model, annotation=None):
+        """CO(lk):
+        query = User.select().annotate(Tweet)  # equivalent to:
+        query = (User
+                .select(User, fn.Count(Tweet.id).alias('count'))
+                .join(Tweet)
+                .group_by(User))
+        """
         if annotation is None:
             annotation = fn.Count(rel_model._meta.primary_key).alias('count')
         query = self.clone()
         query = query.ensure_join(query._query_ctx, rel_model)
         if not query._group_by:
+            # TODO(lk): supress alias in group_by, use origin column name?
             query._group_by = [x.alias() for x in query._select]
         query._select = tuple(query._select) + (annotation,)
         return query
@@ -1865,9 +1943,11 @@ class SelectQuery(Query):
         return query
 
     def aggregate(self, aggregation=None, convert=True):
+        # CO(lk): aggr count of pk by default, convert res as int not tuple.
         return self._aggregate(aggregation).scalar(convert=convert)
 
     def count(self):
+        # CO(lk): if count with group_by or distinct, run the query and COUNT(1)
         if self._distinct or self._group_by:
             return self.wrapped_count()
 
@@ -1910,6 +1990,7 @@ class SelectQuery(Query):
         return self.compiler().generate_select(self)
 
     def verify_naive(self):
+        # CO(lk): ensure all attr selected in on current model in naive select.
         model_class = self.model_class
         for node in self._select:
             if isinstance(node, Field) and node.model_class != model_class:
@@ -1920,6 +2001,8 @@ class SelectQuery(Query):
         if self._dirty or not self._qr:
             model_class = self.model_class
             query_meta = [self._select, self._joins]
+            # NOTE(lk): tuple, dict, naive doesn't take join into consideration
+            #  While ModelQueryResultWrapper instantiate a chain of models
             if self._tuples:
                 ResultWrapper = TuplesQueryResultWrapper
             elif self._dicts:
@@ -2033,16 +2116,24 @@ class ExceptionWrapper(object):
             return
         if exc_type.__name__ in self.exceptions:
             new_type = self.exceptions[exc_type.__name__]
+            # TODO(lk): what's the point to reraise it?
             reraise(new_type, new_type(*exc_value.args), traceback)
 
 
 class Database(object):
+    # CO(lk): overrides defined by sub-classes.
+    #  - field_o: map Field type value in db
+    #  - op_: different op string used in db
+    #  - all booleans mean whether db support the feature.
+    #    False means optional and need to enable it in sub-class.
     commit_select = False
     compiler_class = QueryCompiler
     field_overrides = {}
     foreign_keys = True
+    # CO(lk): row lock
     for_update = False
     interpolation = '?'
+    # CO(lk): max size in pagination
     limit_max = None
     op_overrides = {}
     quote_char = '"'
@@ -2071,6 +2162,7 @@ class Database(object):
             self.__local = type('DummyLocal', (object,), {})
 
         self._conn_lock = threading.Lock()
+        # CO(lk): autorollback is a sub-category of autocommit
         self.autocommit = autocommit
         self.autorollback = autorollback
 
@@ -2086,6 +2178,7 @@ class Database(object):
         return ExceptionWrapper(self.exceptions)
 
     def connect(self):
+        # TODO(lk): check Query, when connect() get called by get_conn()?
         with self._conn_lock:
             if self.deferred:
                 raise Exception('Error, database not properly initialized '
@@ -2160,6 +2253,7 @@ class Database(object):
             else:
                 if require_commit and self.get_autocommit():
                     self.commit()
+        # CO(lk): Cursor.fetchall(): fetch result from cursor
         return cursor
 
     def begin(self):
@@ -2194,6 +2288,7 @@ class Database(object):
         return transaction(self)
 
     def commit_on_success(self, func):
+        # CO(lk): start a trans and only commit if no exc.
         @wraps(func)
         def inner(*args, **kwargs):
             with self.transaction():
@@ -2215,6 +2310,7 @@ class Database(object):
         raise NotImplementedError
 
     def create_table(self, model_class, safe=False):
+        # WARN(lk): not 'safe', but 'force': drop table if exist 'tname';
         qc = self.compiler()
         return self.execute_sql(*qc.create_table(model_class, safe))
 
@@ -2248,6 +2344,8 @@ class Database(object):
             return self.execute_sql(*qc.drop_sequence(seq))
 
     def extract_date(self, date_part, date_field):
+        # CO(lk): extract date from db's datetime-like value, implementaion
+        #  is db specific.
         return fn.EXTRACT(Clause(date_part, R('FROM'), date_field))
 
 class SqliteDatabase(Database):
@@ -2262,10 +2360,12 @@ class SqliteDatabase(Database):
         if not sqlite3:
             raise ImproperlyConfigured('sqlite3 must be installed on the system')
         conn = sqlite3.connect(database, **kwargs)
+        # TODO(lk): how a python func registered as sqlite func
         conn.create_function('date_part', 2, _sqlite_date_part)
         return conn
 
     def get_indexes_for_table(self, table):
+        # TODO(lk): bug? db has no quote(), it's on QC
         res = self.execute_sql('PRAGMA index_list(%s);' % self.quote(table))
         rows = sorted([(r[1], r[2] == 1) for r in res.fetchall()])
         return rows
@@ -2417,6 +2517,7 @@ class transaction(object):
         self.db.rollback()
 
     def __enter__(self):
+        # CO(lk): diable auto commit temporarily in transaction
         self._orig = self.db.get_autocommit()
         self.db.set_autocommit(False)
         if self.db.transaction_depth() == 0:
@@ -2428,6 +2529,7 @@ class transaction(object):
         try:
             if exc_type:
                 self.rollback()
+            # TODO(lk): what is a chained transcation?
             elif self.db.transaction_depth() == 1:
                 try:
                     self.commit()
@@ -2444,6 +2546,7 @@ class savepoint(object):
         self.db = db
         _compiler = db.compiler()
         self.sid = sid or 's' + uuid.uuid4().get_hex()
+        # TODO(lk): QueryCompiler.quote()
         self.quoted_sid = _compiler.quote(self.sid)
 
     def _execute(self, query):
@@ -2497,6 +2600,8 @@ class savepoint_sqlite(savepoint):
 
 class FieldProxy(Field):
     def __init__(self, alias, field_instance):
+        # TODO(lk): hold ModelAlias (model wrapper) and `Field` instance
+        #  Why not field directly?
         self._model_alias = alias
         self.model = self._model_alias.model_class
         self.field_instance = field_instance
@@ -2510,6 +2615,7 @@ class FieldProxy(Field):
         return getattr(self.field_instance, attr)
 
 class ModelAlias(object):
+    # CO(lk): work as Model.alias() in join
     def __init__(self, model_class):
         self.__dict__['model_class'] = model_class
 
@@ -2527,6 +2633,7 @@ class ModelAlias(object):
             FieldProxy(self, f) for f in self.model_class._meta.get_fields()]
 
     def select(self, *selection):
+        # TODO(lk): self is ModelAlias
         query = SelectQuery(self, *selection)
         if self._meta.order_by:
             query = query.order_by(*self._meta.order_by)
@@ -2550,6 +2657,7 @@ class ModelOptions(object):
         self.database = database or default_database
         self.db_table = db_table
         self.indexes = list(indexes or [])
+        # TODO(lk): seems defining a default order
         self.order_by = order_by
         self.primary_key = primary_key
         self.table_alias = table_alias
@@ -2557,11 +2665,16 @@ class ModelOptions(object):
         self.schema = schema
 
         self.auto_increment = None
+        # CO(lk): records foreigns, `ForeignKeyField.add_to_class`
+        # rel: current 'field.name' -> field.
+        # reverse_rel: set from another Model, 'related_name' -> ano.field.
         self.rel = {}
         self.reverse_rel = {}
 
         for key, value in kwargs.items():
             setattr(self, key, value)
+        # WARN(lk): meta class limit `BaseModel.inheritable` attrs inherited
+        #  in Model.Meta. `._additional_keys` expands it.
         self._additional_keys = set(kwargs.keys())
 
     def prepared(self):
@@ -2574,6 +2687,7 @@ class ModelOptions(object):
             for clause in self.order_by:
                 field = self.fields[clause.lstrip('-')]
                 if clause.startswith('-'):
+                    # TODO(lk): desc() and asc()
                     norm_order_by.append(field.desc())
                 else:
                     norm_order_by.append(field.asc())
@@ -2599,15 +2713,21 @@ class ModelOptions(object):
         return [f[1] for f in self.get_sorted_fields()]
 
     def rel_for_model(self, model, field_obj=None):
+        # CO(lk): return 1st foreign Field on current model matching
+        #  为传入的 model 找到 self 上对应其的外键
+        #  - field.rel_model is input model
+        #  - same 'field_obj.name'
         for field in self.get_fields():
             if isinstance(field, ForeignKeyField) and field.rel_model == model:
                 if field_obj is None or field_obj.name == field.name:
                     return field
 
     def reverse_rel_for_model(self, model):
+        # CO(lk): get foreign Field pointing to current model on input model
         return model._meta.rel_for_model(self.model_class)
 
     def rel_exists(self, model):
+        # CO(lk): if there's foreign key pointing to another between 2 models
         return self.rel_for_model(model) or self.reverse_rel_for_model(model)
 
 
@@ -2648,10 +2768,12 @@ class BaseModel(type):
                 if k in attrs:
                     continue
                 if isinstance(v, FieldDescriptor):
+                    # CO(lk): don't inheirt primary key from Model, only from Meta
                     if not v.field.primary_key:
                         attrs[k] = deepcopy(v.field)
 
         # initialize the new class and set the magic attributes
+        # CRITICAL(lk): cls is re-defined/overridden
         cls = super(BaseModel, cls).__new__(cls, name, bases, attrs)
         cls._meta = ModelOptions(cls, **meta_options)
         cls._data = None
@@ -2662,11 +2784,15 @@ class BaseModel(type):
             if isinstance(attr, Field):
                 attr.add_to_class(cls, name)
                 if attr.primary_key and model_pk:
+                    # CO(lk): defined in meta and Field at the same time, or multi
+                    #  primary key Fields.
                     raise ValueError('primary key is overdetermined.')
                 elif attr.primary_key:
                     model_pk = attr
 
         if model_pk is None:
+            # CO(lk): if pk is not defined on current model.
+            #  Inherit from parent or create one automatically.
             if parent_pk:
                 model_pk, name = parent_pk, parent_pk.name
             else:
@@ -2697,6 +2823,7 @@ class BaseModel(type):
 class Model(with_metaclass(BaseModel)):
     def __init__(self, *args, **kwargs):
         self._data = self._meta.get_default_dict()
+        # CO(lk): field names with dirty/unsaved data
         self._dirty = set()
         self._obj_cache = {} # cache of related objects
 
@@ -2741,10 +2868,12 @@ class Model(with_metaclass(BaseModel)):
 
     @classmethod
     def get(cls, *query, **kwargs):
+        # TODO(lk): .naive() doesn't compose foreign key?
         sq = cls.select().naive()
         if query:
             sq = sq.where(*query)
         if kwargs:
+            # TODO(lk): django-like filter query?
             sq = sq.filter(**kwargs)
         return sq.get()
 
@@ -2828,12 +2957,14 @@ class Model(with_metaclass(BaseModel)):
         field_dict = dict(self._data)
         pk = self._meta.primary_key
         if only:
+            # CO(lk): trim and left only the only: {} field
             field_dict = self._prune_fields(field_dict, only)
         if self.get_id() is not None and not force_insert:
             field_dict.pop(pk.name, None)
             self.update(**field_dict).where(self.pk_expr()).execute()
         else:
             pk = self.get_id()
+            # TODO(lk): what if pk is None.
             ret_pk = self.insert(**field_dict).execute()
             if ret_pk is not None:
                 pk = ret_pk
@@ -2848,6 +2979,8 @@ class Model(with_metaclass(BaseModel)):
         return [f for f in self._meta.get_fields() if f.name in self._dirty]
 
     def dependencies(self, search_nullable=False):
+        # CO(lk): based on subquery composing. Find those model with
+        #  fk pointing to us.
         query = self.select().where(self.pk_expr())
         stack = [(type(self), query)]
         seen = set()
@@ -2860,6 +2993,7 @@ class Model(with_metaclass(BaseModel)):
             for rel_name, fk in klass._meta.reverse_rel.items():
                 rel_model = fk.model_class
                 node = fk << query
+                # CO(lk): if the fk pointing to us 'nullable', leave theme alone.
                 if not fk.null or search_nullable:
                     stack.append((rel_model, rel_model.select().where(node)))
                 yield (node, fk)
@@ -2886,6 +3020,7 @@ class Model(with_metaclass(BaseModel)):
 
 
 def prefetch_add_subquery(sq, subqueries):
+    # CO(lk): (a, b) select condition, field (attr) to set on former model
     fixed_queries = [(sq, None)]
     for i, subquery in enumerate(subqueries):
         if not isinstance(subquery, Query) and issubclass(subquery, Model):
@@ -2900,21 +3035,26 @@ def prefetch_add_subquery(sq, subqueries):
         if not fkf:
             raise AttributeError('Error: unable to find foreign key for '
                                  'query: %s' % subquery)
+        # WARN(lk): fetch outside/back/Tweets (for multi inner) first.
+        #  Compose a cascading, full chained subquery SQL here.
         fixed_queries.append((subquery.where(fkf << last_query), fkf))
 
     return fixed_queries
 
 def prefetch(sq, *subqueries):
+    # CO(lk): subquery select .fk on 1st Model. Consider User and Tweet.
     if not subqueries:
         return sq
     fixed_queries = prefetch_add_subquery(sq, subqueries)
 
+    # CO(lk): deps: {Model: {fk_id: [ins, ins]}}
     deps = {}
     rel_map = {}
     for query, foreign_key_field in reversed(fixed_queries):
         query_model = query.model_class
         deps[query_model] = {}
         id_map = deps[query_model]
+        # CO(lk): we traverse from the back, fk may has be fetched in former loop.
         has_relations = bool(rel_map.get(query_model))
 
         for result in query:
@@ -2926,9 +3066,12 @@ def prefetch(sq, *subqueries):
                 for rel_model, rel_fk in rel_map[query_model]:
                     rel_name = '%s_prefetch' % rel_fk.related_name
                     rel_instances = deps[rel_model].get(result.get_id(), [])
+                    # CO(lk): Tweet.user = User, User.tweets_pretch = [Tweet,]
                     for inst in rel_instances:
                         setattr(inst, rel_fk.name, result)
                     setattr(result, rel_name, rel_instances)
+        # CO(lk): since we traverse from back to front. Inner model has no been
+        #  fetched yet. Save inner rel_model -> current fk mapping, set them later.
         if foreign_key_field:
             rel_model = foreign_key_field.rel_model
             rel_map.setdefault(rel_model, [])
@@ -2951,6 +3094,9 @@ def sort_models_topologically(models):
     models = set(models)
     seen = set()
     ordering = []
+    # CO(lk): depth-first search. Cause this is a reverse search
+    #  (fk pointing to us), reverse them at the end. This makes parent first
+    #  and a sound deletion order.
     def dfs(model):
         if model in models and model not in seen:
             seen.add(model)
